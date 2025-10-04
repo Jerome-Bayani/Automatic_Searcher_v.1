@@ -1,109 +1,87 @@
+# app/sources_gsheet.py
 from __future__ import annotations
+
+import os
+import string
+import time
 from dataclasses import dataclass
-from typing import List, Optional
-import datetime as dt
-import pathlib
+from typing import Iterable, List, Tuple
 
 import gspread
 from google.oauth2.service_account import Credentials
 
-from .config import (
-    GSHEET_STATUS_COLUMN,
-    GSHEET_CLEAR_ON_DONE,
-    GSHEET_ARCHIVE_SHEET,
-)
 
-@dataclass(frozen=True)
-class SheetItem:
-    row: int
-    text: str
+def _col_letter_to_index(letter: str) -> int:
+    letter = (letter or "A").strip().upper()
+    idx = 0
+    for ch in letter:
+        idx = idx * 26 + (ord(ch) - ord("A") + 1)
+    return max(1, idx)
+
+
+@dataclass
+class SheetConfig:
+    status_col_letter: str
+    answer_col_letter: str
+
+    @property
+    def status_idx(self) -> int:
+        return _col_letter_to_index(self.status_col_letter)
+
+    @property
+    def answer_idx(self) -> int:
+        return _col_letter_to_index(self.answer_col_letter)
+
 
 class GoogleSheetSource:
-    """
-    Reads items from a Google Sheet:
-      - Questions in column `column_letter` (default A)
-      - Optional Status column marks processed rows (default B)
-    After you send an item, call mark_done(item) to write back:
-      - Writes 'DONE <timestamp>' to the Status column
-      - Optionally clears the question cell
-      - Optionally appends to an Archive worksheet
-    """
+    """Reads questions from a column and can write answers / statuses on the same row."""
+
     def __init__(
         self,
-        creds_json: str | pathlib.Path,
+        service_account_json: str,
         sheet_id: str,
+        *,
         worksheet: str = "Sheet1",
         column_letter: str = "A",
-        status_column: str = GSHEET_STATUS_COLUMN,
     ) -> None:
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ]
-        creds = Credentials.from_service_account_file(str(pathlib.Path(creds_json)), scopes=scopes)
-        self._gc = gspread.authorize(creds)
-        self._sheet_id = sheet_id
-        self._ws_name = worksheet
-        self._col = column_letter.upper()
-        self._status_col = status_column.upper()
-        self._pending: List[SheetItem] = []
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        creds = Credentials.from_service_account_file(service_account_json, scopes=scopes)
+        gc = gspread.authorize(creds)
 
-    # ---- read ----
-    def get_items(self) -> List[SheetItem]:
-        """Return pending items (question text + row index) where Status cell is empty."""
-        sh = self._gc.open_by_key(self._sheet_id)
-        ws = sh.worksheet(self._ws_name)
+        self._sh = gc.open_by_key(sheet_id)
+        self._ws = self._sh.worksheet(worksheet)
 
-        values = ws.col_values(ord(self._col) - 64)  # A=1
-        # Pad so indexing by row works safely later
-        values = [""] + values  # 1-based
-
-        status_vals: list[str]
-        try:
-            status_vals = ws.col_values(ord(self._status_col) - 64)
-            status_vals = [""] + status_vals
-        except Exception:
-            status_vals = [""]
-
-        items: List[SheetItem] = []
-        max_row = max(len(values) - 1, len(status_vals) - 1)
-        for row in range(1, max_row + 1):
-            text = values[row] if row < len(values) else ""
-            status = status_vals[row] if row < len(status_vals) else ""
-            if text and not status:
-                items.append(SheetItem(row=row, text=text))
-
-        self._pending = items
-        return items
-
-    # ---- write-back ----
-    def mark_done(self, item: SheetItem) -> None:
-        """
-        Mark a single row as processed:
-          - Status cell: 'DONE <timestamp>'
-          - Optional: clear question cell
-          - Optional: append to Archive sheet as [timestamp, text, row]
-        """
-        sh = self._gc.open_by_key(self._sheet_id)
-        ws = sh.worksheet(self._ws_name)
-
-        ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        status_a1 = f"{self._status_col}{item.row}"
-        question_a1 = f"{self._col}{item.row}"
-
-        # Batch update in one request when possible
-        updates = [{"range": status_a1, "values": [[f"DONE {ts}"]]}]
-        if GSHEET_CLEAR_ON_DONE:
-            updates.append({"range": question_a1, "values": [[""]]})
-
-        ws.batch_update(
-            [{"range": u["range"], "values": u["values"]} for u in updates],
-            value_input_option="RAW",
+        self._q_col_idx = _col_letter_to_index(column_letter)
+        self._cfg = SheetConfig(
+            status_col_letter=os.getenv("GSHEET_STATUS_COLUMN", "B"),
+            answer_col_letter=os.getenv("ANSWER_COLUMN", "C"),
         )
 
-        if GSHEET_ARCHIVE_SHEET:
-            try:
-                arch = sh.worksheet(GSHEET_ARCHIVE_SHEET)
-            except gspread.WorksheetNotFound:
-                arch = sh.add_worksheet(title=GSHEET_ARCHIVE_SHEET, rows=1000, cols=3)
-            arch.append_row([ts, item.text, item.row], value_input_option="RAW")
+    # --- reading -------------------------------------------------------------
+
+    def iter_pending(self) -> Iterable[Tuple[int, str]]:
+        """Yield (row_index, question_text) where status cell is empty."""
+        questions: List[str] = self._ws.col_values(self._q_col_idx)
+        statuses: List[str] = self._ws.col_values(self._cfg.status_idx)
+
+        # normalize lengths
+        max_len = max(len(questions), len(statuses))
+        questions += [""] * (max_len - len(questions))
+        statuses += [""] * (max_len - len(statuses))
+
+        for i, (q, st) in enumerate(zip(questions, statuses), start=1):
+            q = (q or "").strip()
+            st = (st or "").strip()
+            if i == 1:
+                # skip header row if you use headers
+                continue
+            if q and not st:
+                yield i, q
+
+    # --- writing -------------------------------------------------------------
+
+    def write_answer(self, row: int, answer: str) -> None:
+        """Write answer to ANSWER_COLUMN at given row, and stamp DONE in STATUS column."""
+        self._ws.update_cell(row, self._cfg.answer_idx, answer)
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        self._ws.update_cell(row, self._cfg.status_idx, f"DONE {stamp}")
