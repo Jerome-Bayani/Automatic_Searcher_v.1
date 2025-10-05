@@ -6,18 +6,23 @@ import os
 import random
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Callable
 
 from playwright.sync_api import Page, sync_playwright
 
-
+# --- Config from environment (kept local here to keep this module drop-in) ---
 CDP_URL = os.getenv("CDP_URL", "http://127.0.0.1:9222")
 
-# Poll cadence + think-time (can be overridden in .env)
+# Poll cadence + think-time (can be overridden via .env)
 POLL_BASE_S = float(os.getenv("POLL_BASE_S", "1.0"))
 POLL_JITTER_S = float(os.getenv("POLL_JITTER_S", "0.5"))
 THINK_MIN_S = float(os.getenv("THINK_MIN_S", "0.6"))
 THINK_MAX_S = float(os.getenv("THINK_MAX_S", "3.2"))
+
+# NEW: Human-like pause BEFORE hitting Enter (after paste/fill).
+# You asked for 3–8 seconds by default; can override via .env if needed.
+PASTE_SEND_MIN_S = float(os.getenv("PASTE_SEND_MIN_S", "3.0"))
+PASTE_SEND_MAX_S = float(os.getenv("PASTE_SEND_MAX_S", "8.0"))
 
 # Textbox selectors (we’ll try these in order)
 TEXTBOX_CANDIDATES = [
@@ -29,21 +34,23 @@ TEXTBOX_CANDIDATES = [
     '[contenteditable="true"][role="textbox"]',
 ]
 
-
+# ---- utility sleeps ----
 def _jitter_sleep() -> None:
     time.sleep(max(0.05, POLL_BASE_S + random.uniform(-POLL_JITTER_S, POLL_JITTER_S)))
-
 
 def _think() -> None:
     time.sleep(random.uniform(THINK_MIN_S, THINK_MAX_S))
 
+def _pre_send_sleep() -> None:
+    """Human-like pause before pressing Enter (after we paste/fill the question)."""
+    lo, hi = PASTE_SEND_MIN_S, max(PASTE_SEND_MIN_S, PASTE_SEND_MAX_S)
+    time.sleep(random.uniform(lo, hi))
 
 def _is_chatgpt(page: Page) -> bool:
     u = (page.url or "").lower()
     return ("chat.openai.com" in u) or ("chatgpt.com" in u)
 
-
-# Stealth DOM probe (robust across small UI changes)
+# ---- Stealth DOM probe (robust across small UI changes) ----
 EVAL_JS = r"""
 (() => {
   const txt = n => (n && n.innerText ? n.innerText.trim() : "");
@@ -79,13 +86,11 @@ EVAL_JS = r"""
 })()
 """
 
-
 @dataclass
 class _State:
     generating: bool
     last_assistant: str
     last_user: str
-
 
 def _read_state(page: Page) -> _State:
     d = page.evaluate(EVAL_JS)
@@ -94,7 +99,6 @@ def _read_state(page: Page) -> _State:
         last_assistant=str(d.get("lastAssistant", "")),
         last_user=str(d.get("lastUser", "")),
     )
-
 
 class ChatGPTWeb:
     """Attach to existing Chrome (CDP) and ask ChatGPT, returning the final answer text."""
@@ -131,9 +135,10 @@ class ChatGPTWeb:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
+        # IMPORTANT: do not close the user's Chrome window(s).
+        # We only stop Playwright so we detach cleanly.
         try:
-            if self._browser:
-                self._browser.close()
+            pass
         finally:
             if self._p:
                 self._p.stop()
@@ -144,6 +149,7 @@ class ChatGPTWeb:
         # 1) ARIA role (usually stable)
         try:
             tb = self.page.get_by_role("textbox").first
+            tb.wait_for(timeout=800)
             tb.scroll_into_view_if_needed()
             tb.click(timeout=2000)
             return True
@@ -154,7 +160,8 @@ class ChatGPTWeb:
         for sel in TEXTBOX_CANDIDATES:
             loc = self.page.locator(sel).first
             try:
-                if loc.count() and loc.is_visible():
+                self.page.wait_for_selector(sel, timeout=800)
+                if loc.is_visible():
                     loc.scroll_into_view_if_needed()
                     loc.click(timeout=1500)
                     return True
@@ -214,7 +221,8 @@ class ChatGPTWeb:
               return true;
             }
             if (el.isContentEditable) {
-              el.innerText = txt;
+              // Prefer textContent to preserve raw newlines/whitespace more reliably
+              el.textContent = txt;
               el.dispatchEvent(new Event('input', {bubbles:true}));
               return true;
             }
@@ -229,9 +237,22 @@ class ChatGPTWeb:
 
     # ---------- public API ----------
 
-    def ask_and_wait(self, prompt: str) -> str:
-        """Type prompt, submit, wait for generation to complete, return full assistant answer."""
+    def ask_and_wait(
+        self,
+        prompt: str,
+        *,
+        warn_after_s: float = 5 * 60,     # 5 minutes soft warn
+        hard_stop_s: float = 15 * 60,     # total cap ~15 minutes (5 warn + 10 grace)
+        on_warn: Optional[Callable[[float], None]] = None
+    ) -> str:
+        """
+        Type prompt, submit, wait for generation to complete, return full assistant answer.
+        Soft-warns once after warn_after_s (if on_warn given). Raises TimeoutError at hard_stop_s.
+        """
         assert self.page is not None, "Not connected"
+
+        start_ts = time.time()
+        warned = False
 
         # Make absolutely sure the textbox is focused before first send
         if not self._ensure_textbox_focus():
@@ -246,13 +267,27 @@ class ChatGPTWeb:
                 # final fallback: type it (slower)
                 self.page.keyboard.type(prompt, delay=10)
 
-        _think()
+        # NEW: vary delay 3–8s (configurable) before sending
+        _pre_send_sleep()
         self.page.keyboard.press("Enter")
 
         prev_generating = False
         prev_fp = ""
 
         while True:
+            # ---- timing / notifications ----
+            elapsed = time.time() - start_ts
+            if (not warned) and elapsed >= warn_after_s:
+                warned = True
+                if on_warn:
+                    try:
+                        on_warn(elapsed)
+                    except Exception:
+                        pass  # never let callbacks break the loop
+            if elapsed >= hard_stop_s:
+                raise TimeoutError(f"Generation timed out after {int(elapsed)}s")
+
+            # ---- normal polling loop ----
             s = _read_state(self.page)
 
             # generation just started

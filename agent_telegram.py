@@ -1,3 +1,4 @@
+# agent_telegram.py
 from __future__ import annotations
 import asyncio
 import os
@@ -12,6 +13,7 @@ from app.runner import run
 from app.sources_gsheet import GoogleSheetSource
 from app.config import DEFAULT_DELAY_SECONDS
 from app.notifications import notify, notify_error  # uses requests (sync), very reliable
+from app.shutdown import install as install_shutdown_hook  # NEW
 
 load_dotenv()
 
@@ -97,7 +99,34 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     err = context.error or Exception("unknown error")
     notify_error(f"{VM_NAME} agent handler", err)
 
+def _on_process_exit() -> None:
+    """
+    Called when the Python process is exiting for ANY reason we can catch:
+    - Ctrl+C / SIGINT
+    - SIGTERM / taskkill
+    - Windows console close (clicking the X)
+    - Normal interpreter shutdown (atexit)
+    """
+    # If a job is running, request stop so runner can exit promptly.
+    global _stop_event, _running
+    if _running and _stop_event:
+        try:
+            _stop_event.set()
+        except Exception:
+            pass
+
+    # Fire a best-effort Telegram notification.
+    # (Using synchronous notify to avoid relying on the event loop during teardown.)
+    try:
+        notify(f"[{VM_NAME}] Process exiting (terminal closed or killed)")
+    except Exception:
+        # Swallow any errors during shutdown
+        pass
+
 def main() -> None:
+    # Install shutdown hooks BEFORE starting the bot loop
+    install_shutdown_hook(_on_process_exit)
+
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stop", cmd_stop))
