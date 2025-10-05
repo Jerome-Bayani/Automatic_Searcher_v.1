@@ -19,8 +19,7 @@ POLL_JITTER_S = float(os.getenv("POLL_JITTER_S", "0.5"))
 THINK_MIN_S = float(os.getenv("THINK_MIN_S", "0.6"))
 THINK_MAX_S = float(os.getenv("THINK_MAX_S", "3.2"))
 
-# NEW: Human-like pause BEFORE hitting Enter (after paste/fill).
-# You asked for 3–8 seconds by default; can override via .env if needed.
+# Human-like pause BEFORE hitting Enter (after paste/fill).
 PASTE_SEND_MIN_S = float(os.getenv("PASTE_SEND_MIN_S", "3.0"))
 PASTE_SEND_MAX_S = float(os.getenv("PASTE_SEND_MAX_S", "8.0"))
 
@@ -86,6 +85,59 @@ EVAL_JS = r"""
 })()
 """
 
+# Find conversation link by exact title (case-insensitive); scrolls sidebar while searching.
+EVAL_FIND_LINK_BY_TITLE = r"""
+async (targetTitle) => {
+  const norm = (s) => (s || "").replace(/\s+/g, " ").trim().toLowerCase();
+  const wanted = norm(targetTitle);
+
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+  // pick a scrollable sidebar if present; else fall back to page scroller
+  const candidates = ['aside', 'nav', '[data-testid="left-sidebar"]', 'div[role="navigation"]', 'div[class*="sidebar"]'];
+  let scroller = null;
+  for (const sel of candidates) {
+    const el = document.querySelector(sel);
+    if (el && el.scrollHeight > el.clientHeight) { scroller = el; break; }
+  }
+  if (!scroller) scroller = document.scrollingElement || document.body;
+
+  const getLinks = () => Array.from(document.querySelectorAll('a[href*="/c/"]'));
+  const getTitle = (a) => {
+    const t = (a.innerText || a.textContent || "").trim();
+    if (t) return t;
+    const a11y = (a.getAttribute("aria-label") || a.getAttribute("title") || "").trim();
+    return a11y;
+  };
+
+  let stagnant = 0;
+  for (let i = 0; i < 80; i++) { // ~12s max
+    const links = getLinks();
+    for (const a of links) {
+      const t = getTitle(a);
+      if (!t) continue;
+      if (norm(t) === wanted) {
+        const href = a.getAttribute("href");
+        if (href && href.includes("/c/")) {
+          const abs = new URL(href, location.origin).toString();
+          return { ok: true, href: abs, title: t };
+        }
+      }
+    }
+    const before = scroller.scrollTop;
+    scroller.scrollTop = scroller.scrollHeight;
+    await sleep(150);
+    if (scroller.scrollTop === before) {
+      stagnant += 1;
+      if (stagnant >= 3) break; // reached end
+    } else {
+      stagnant = 0;
+    }
+  }
+  return { ok: false };
+}
+"""
+
 @dataclass
 class _State:
     generating: bool
@@ -136,7 +188,6 @@ class ChatGPTWeb:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         # IMPORTANT: do not close the user's Chrome window(s).
-        # We only stop Playwright so we detach cleanly.
         try:
             pass
         finally:
@@ -206,6 +257,28 @@ class ChatGPTWeb:
             ok = self._focus_via_locators() or self._force_focus_via_js()
         return ok
 
+    # ---------- conversation helpers ----------
+
+    def ensure_conversation(self, title: str, *, nav_timeout_s: float = 30.0) -> bool:
+        """
+        Ensure we're on the conversation whose title matches `title` (case-insensitive).
+        Returns True if navigated/found, False otherwise.
+        """
+        title = (title or "").strip()
+        if not title:
+            return True  # nothing to enforce
+
+        try:
+            res = self.page.evaluate(EVAL_FIND_LINK_BY_TITLE, title)
+            if not (res and res.get("ok")):
+                return False
+            href = res["href"]
+            # Navigate directly to the conversation link
+            self.page.goto(href, wait_until="domcontentloaded", timeout=int(nav_timeout_s * 1000))
+            return True
+        except Exception:
+            return False
+
     # ---------- typing helpers ----------
 
     def _paste_text_via_js(self, text: str) -> bool:
@@ -267,7 +340,7 @@ class ChatGPTWeb:
                 # final fallback: type it (slower)
                 self.page.keyboard.type(prompt, delay=10)
 
-        # NEW: vary delay 3–8s (configurable) before sending
+        # Vary delay 3–8s (configurable) before sending
         _pre_send_sleep()
         self.page.keyboard.press("Enter")
 

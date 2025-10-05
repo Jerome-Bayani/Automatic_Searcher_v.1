@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import os
-import string
 import time
 from dataclasses import dataclass
 from typing import Iterable, List, Tuple
@@ -59,6 +58,17 @@ class GoogleSheetSource:
 
     # --- reading -------------------------------------------------------------
 
+    def get_conversation_title(self) -> str:
+        """
+        Return the text in row 1 of the questions column (e.g., A1 if column_letter='A').
+        This is used to select the ChatGPT conversation by title.
+        """
+        try:
+            v = self._ws.cell(1, self._q_col_idx).value or ""
+        except Exception:
+            v = ""
+        return (v or "").strip()
+
     def iter_pending(self) -> Iterable[Tuple[int, str]]:
         """Yield (row_index, question_text) where status cell is empty."""
         questions: List[str] = self._ws.col_values(self._q_col_idx)
@@ -73,7 +83,7 @@ class GoogleSheetSource:
             q = (q or "").strip()
             st = (st or "").strip()
             if i == 1:
-                # skip header row if you use headers
+                # skip header row; A1 is reserved for conversation title
                 continue
             if q and not st:
                 yield i, q

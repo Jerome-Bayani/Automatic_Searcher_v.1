@@ -6,7 +6,7 @@ from threading import Event
 from typing import Protocol
 
 from app.webclient_chatgpt import ChatGPTWeb
-from app.notifications import notify  # <-- add this import
+from app.notifications import notify
 
 
 class QuestionSourceProto(Protocol):
@@ -14,6 +14,8 @@ class QuestionSourceProto(Protocol):
         """Yield (row_index, question_text)."""
         ...
     def write_answer(self, row: int, answer: str) -> None:  # type: ignore[override]
+        ...
+    def get_conversation_title(self) -> str:
         ...
 
 
@@ -30,6 +32,17 @@ def run(source: QuestionSourceProto, *, stop_event: Event | None = None) -> None
     halfway_notified = False
 
     with ChatGPTWeb() as web:
+        # --- NEW: ensure we're on the right ChatGPT conversation based on A1 ---
+        title = (source.get_conversation_title() or "").strip()
+        if title:
+            ok = web.ensure_conversation(title)
+            if not ok:
+                msg = f"Conversation titled '{title}' not found. Stopping."
+                print(msg)
+                notify(msg)
+                return
+            print(f"Using conversation: {title}")
+
         for row_idx, q in items:
             # allow /stop from the agent to interrupt cleanly
             if stop_event and stop_event.is_set():
