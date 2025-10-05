@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
+import time
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -11,9 +12,9 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 from app.runner import run
 from app.sources_gsheet import GoogleSheetSource
-from app.config import DEFAULT_DELAY_SECONDS
+from app.config import DEFAULT_DELAY_SECONDS, EST_SECONDS_PER_QUESTION
 from app.notifications import notify, notify_error  # uses requests (sync), very reliable
-from app.shutdown import install as install_shutdown_hook  # NEW
+from app.shutdown import install as install_shutdown_hook  # keeps your exit notifications
 
 load_dotenv()
 
@@ -43,17 +44,38 @@ async def _send(ctx: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     try:
         await ctx.bot.send_message(chat_id=CHAT_ID, text=f"[{VM_NAME}] {text}")
     except Exception as e:
-        # network hiccup: fall back to our synchronous notifier
         notify_error(f"{VM_NAME} agent send", e)
         notify(f"[{VM_NAME}] {text}")
+
+def _fmt_mmss(seconds: int) -> str:
+    m, s = divmod(max(0, seconds), 60)
+    return f"{m:d}m {s:02d}s"
 
 def _work():
     """Runs in a thread; sends error or finished notification and clears running flag."""
     global _running
+    start_ts = time.time()
     try:
+        # Build source & pre-count questions to announce ETA
         src = GoogleSheetSource(GSA_JSON, SHEET_ID, worksheet=WORKSHEET, column_letter=COLUMN)
-        run(src, stop_event=_stop_event)  # runner sends start/halfway/finish; we add an extra finish ping
-        notify(f"[{VM_NAME}] Job finished")
+        pending = list(src.iter_pending())
+        total = len(pending)
+
+        if total == 0:
+            notify(f"[{VM_NAME}] No pending questions")
+            _running = False
+            return
+
+        eta_sec = total * EST_SECONDS_PER_QUESTION
+        notify(f"[{VM_NAME}] Job started • {total} questions • ETA ~ {_fmt_mmss(eta_sec)}")
+
+        # Now run using the same source instance (no double reads in Sheets)
+        run(src, stop_event=_stop_event)
+
+        # Finished — include actual duration
+        elapsed = int(time.time() - start_ts)
+        notify(f"[{VM_NAME}] Job finished\nDuration: {_fmt_mmss(elapsed)}")
+
     except Exception as e:
         notify_error(f"{VM_NAME} job", e)
     finally:
@@ -69,11 +91,13 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     _running = True
     _stop_event = threading.Event()
+
+    # Keep this line (quick confirmation in chat), but the detailed ETA is sent by _work()
     await _send(ctx, f"Starting job • delay={DEFAULT_DELAY_SECONDS}s")
 
     loop = asyncio.get_running_loop()
     _job_task = loop.create_task(asyncio.to_thread(_work))  # background; do NOT await
-    await _send(ctx, "Job started.")
+    # Remove the old "Job started." message; we now send a detailed one from _work().
 
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _ok_sender(update):
@@ -100,31 +124,19 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     notify_error(f"{VM_NAME} agent handler", err)
 
 def _on_process_exit() -> None:
-    """
-    Called when the Python process is exiting for ANY reason we can catch:
-    - Ctrl+C / SIGINT
-    - SIGTERM / taskkill
-    - Windows console close (clicking the X)
-    - Normal interpreter shutdown (atexit)
-    """
-    # If a job is running, request stop so runner can exit promptly.
+    """Best-effort exit notifier (see app/shutdown.py)."""
     global _stop_event, _running
     if _running and _stop_event:
         try:
             _stop_event.set()
         except Exception:
             pass
-
-    # Fire a best-effort Telegram notification.
-    # (Using synchronous notify to avoid relying on the event loop during teardown.)
     try:
         notify(f"[{VM_NAME}] Process exiting (terminal closed or killed)")
     except Exception:
-        # Swallow any errors during shutdown
         pass
 
 def main() -> None:
-    # Install shutdown hooks BEFORE starting the bot loop
     install_shutdown_hook(_on_process_exit)
 
     app = Application.builder().token(BOT_TOKEN).build()
