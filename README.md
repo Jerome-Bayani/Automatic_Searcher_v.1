@@ -15,10 +15,10 @@ Each VM runs an independent agent (e.g., `antix-01`, `antix-02`) that connects t
 ---
 
 ## 🗂 Folder Structure
+
 Automatic Searcher v.1/
 │
 ├─ main.py # Entry point (runs depending on config)
-│
 ├─ .env # Environment variables (API keys, Sheet IDs, etc.)
 │
 ├─ app/
@@ -29,15 +29,13 @@ Automatic Searcher v.1/
 │ ├─ webclient_chatgpt.py # Playwright connector to Chrome (CDP)
 │ ├─ monitor_chatgpt.py # Detects generation state & logs output
 │ ├─ config.py # Shared configuration (delays, sheet info, etc.)
-│ ├─ init.py # marks folder as Python package
+│ ├─ init.py # Marks folder as Python package
 │
 ├─ artifacts/ # Logs & saved JSON answers
 │ └─ chatgpt_answers.jsonl
 │
 └─ requirements.txt # Dependencies for pip install
 
-yaml
-Copy code
 
 ---
 
@@ -51,9 +49,6 @@ TELEGRAM_BOT_TOKEN=xxxxx
 TELEGRAM_CHAT_ID=xxxxx
 VM_NAME=antix-01
 CDP_URL=http://127.0.0.1:9222
-
-yaml
-Copy code
 
 ---
 
