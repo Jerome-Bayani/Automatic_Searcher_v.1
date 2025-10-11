@@ -1,36 +1,28 @@
 # agent_telegram.py
 from __future__ import annotations
 import asyncio
-import os
 import threading
 import time
 from typing import Optional
 
-from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from app.runner import run
 from app.sources_gsheet import GoogleSheetSource
+from app.notifications import notify, notify_error
+from app.shutdown import install as install_shutdown_hook
 from app.config import (
-    DEFAULT_DELAY_SECONDS,
-    EST_SECONDS_PER_QUESTION,
+    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+    DEFAULT_DELAY_SECONDS, EST_SECONDS_PER_QUESTION,
     MINI_BREAK_EVERY_N, MINI_BREAK_MIN_S, MINI_BREAK_MAX_S,
     LONG_BREAK_EVERY_N, LONG_BREAK_MIN_S, LONG_BREAK_MAX_S,
     MAX_CONTINUOUS_RUNTIME_S, COOLDOWN_RUNTIME_S,
+    VM_NAME, GSA_JSON, SHEET_ID, WORKSHEET, COLUMN,
 )
-from app.notifications import notify, notify_error  # uses requests (sync), very reliable
-from app.shutdown import install as install_shutdown_hook  # keeps your exit notifications
 
-load_dotenv()
-
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
-VM_NAME = os.getenv("VM_NAME", "vm")
-GSA_JSON = os.getenv("GSA_JSON")
-SHEET_ID = os.getenv("SHEET_ID")
-WORKSHEET = os.getenv("WORKSHEET", "Sheet1")
-COLUMN = os.getenv("COLUMN", "A")
+BOT_TOKEN = TELEGRAM_BOT_TOKEN
+CHAT_ID = int(TELEGRAM_CHAT_ID or "0")
 
 if not (BOT_TOKEN and CHAT_ID and GSA_JSON and SHEET_ID):
     raise SystemExit("Missing BOT_TOKEN/CHAT_ID/GSA_JSON/SHEET_ID in .env")
@@ -45,10 +37,6 @@ def _ok_sender(update: Update) -> bool:
 
 
 async def _send(ctx: ContextTypes.DEFAULT_TYPE, text: str) -> None:
-    """
-    Send a message via PTB; if it times out or fails, fall back to requests-based notify().
-    This keeps the agent responsive even on flaky networks.
-    """
     try:
         await ctx.bot.send_message(chat_id=CHAT_ID, text=f"[{VM_NAME}] {text}")
     except Exception as e:
@@ -66,40 +54,19 @@ def _avg(a: int, b: int) -> float:
 
 
 def _project_eta_seconds(total_questions: int, est_seconds_per_q: int) -> int:
-    """
-    Project ETA including:
-      - baseline time per question
-      - mini breaks after every 15 (if more remain), duration averaged (min..max)
-      - long breaks after every 100 (if more remain), duration averaged (min..max)
-      - 12h safety cooldown (adds 6h each time the projected elapsed crosses 12h)
-    Notes:
-      * Breaks are counted when the milestone < total (i.e., if exactly N=100, the long break
-        does NOT apply because the run would end right at 100).
-      * Safety cooldown treats all elapsed time (including breaks) as contributing toward 12h.
-        Cooldown time itself does not contribute to the "continuous" window.
-    """
     if total_questions <= 0:
         return 0
 
-    # Base time
     base = total_questions * int(est_seconds_per_q)
 
-    # Break counts (only if more questions remain past the milestone)
-    # mini at 15,30,45,... < total
     num_mini = (total_questions - 1) // max(1, int(MINI_BREAK_EVERY_N))
-    # long at 100,200,... < total
     num_long = (total_questions - 1) // max(1, int(LONG_BREAK_EVERY_N))
 
     avg_mini = _avg(int(MINI_BREAK_MIN_S), int(MINI_BREAK_MAX_S))
     avg_long = _avg(int(LONG_BREAK_MIN_S), int(LONG_BREAK_MAX_S))
-
     breaks_total = int(num_mini * avg_mini + num_long * avg_long)
 
-    # Duration without cooldowns (but including breaks, which DO count to continuous time)
     duration_wo_cooldown = base + breaks_total
-
-    # Safety cooldowns: every time the "continuous" elapsed crosses 12h, insert a 6h pause.
-    # Because cooldown resets the "continuous" window, we can compute the count directly:
     num_cooldowns = duration_wo_cooldown // int(MAX_CONTINUOUS_RUNTIME_S)
     cooldown_total = int(num_cooldowns * int(COOLDOWN_RUNTIME_S))
 
@@ -107,11 +74,9 @@ def _project_eta_seconds(total_questions: int, est_seconds_per_q: int) -> int:
 
 
 def _work():
-    """Runs in a thread; sends error or finished notification and clears running flag."""
     global _running
     start_ts = time.time()
     try:
-        # Build source & pre-count questions to announce ETA (including planned breaks & cooldown)
         src = GoogleSheetSource(GSA_JSON, SHEET_ID, worksheet=WORKSHEET, column_letter=COLUMN)
         pending = list(src.iter_pending())
         total = len(pending)
@@ -124,10 +89,8 @@ def _work():
         eta_sec = _project_eta_seconds(total, EST_SECONDS_PER_QUESTION)
         notify(f"[{VM_NAME}] Job started • {total} questions • ETA ~ {_fmt_mmss(eta_sec)}")
 
-        # Now run using the same source instance (no double reads in Sheets)
         run(src, stop_event=_stop_event)
 
-        # Finished — include actual duration
         elapsed = int(time.time() - start_ts)
         notify(f"[{VM_NAME}] Job finished\nDuration: {_fmt_mmss(elapsed)}")
 
@@ -147,13 +110,10 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     _running = True
     _stop_event = threading.Event()
-
-    # Quick confirmation in chat (detailed ETA comes from _work())
     await _send(ctx, f"Starting job • delay={DEFAULT_DELAY_SECONDS}s")
 
     loop = asyncio.get_running_loop()
-    _job_task = loop.create_task(asyncio.to_thread(_work))  # background; do NOT await
-    # We don't send "Job started" here; _work() sends with total+ETA.
+    _job_task = loop.create_task(asyncio.to_thread(_work))
 
 
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -185,7 +145,6 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def _on_process_exit() -> None:
-    """Best-effort exit notifier (see app/shutdown.py)."""
     global _stop_event, _running
     if _running and _stop_event:
         try:

@@ -2,26 +2,17 @@
 from __future__ import annotations
 
 import hashlib
-import os
 import random
 import time
 from dataclasses import dataclass
 from typing import Optional, Callable
 
 from playwright.sync_api import Page, sync_playwright
-
-# --- Config from environment (kept local here to keep this module drop-in) ---
-CDP_URL = os.getenv("CDP_URL", "http://127.0.0.1:9222")
-
-# Poll cadence + think-time (can be overridden via .env)
-POLL_BASE_S = float(os.getenv("POLL_BASE_S", "1.0"))
-POLL_JITTER_S = float(os.getenv("POLL_JITTER_S", "0.5"))
-THINK_MIN_S = float(os.getenv("THINK_MIN_S", "0.6"))
-THINK_MAX_S = float(os.getenv("THINK_MAX_S", "3.2"))
-
-# Human-like pause BEFORE hitting Enter (after paste/fill).
-PASTE_SEND_MIN_S = float(os.getenv("PASTE_SEND_MIN_S", "3.0"))
-PASTE_SEND_MAX_S = float(os.getenv("PASTE_SEND_MAX_S", "8.0"))
+from app.config import (
+    CDP_URL as CFG_CDP_URL,
+    POLL_BASE_S, POLL_JITTER_S, THINK_MIN_S, THINK_MAX_S,
+    PASTE_SEND_MIN_S, PASTE_SEND_MAX_S,
+)
 
 # Textbox selectors (we’ll try these in order)
 TEXTBOX_CANDIDATES = [
@@ -155,8 +146,9 @@ def _read_state(page: Page) -> _State:
 class ChatGPTWeb:
     """Attach to existing Chrome (CDP) and ask ChatGPT, returning the final answer text."""
 
-    def __init__(self, cdp_url: str = CDP_URL):
-        self._cdp_url = cdp_url
+    def __init__(self, cdp_url: Optional[str] = None):
+        # Only read from centralized config; allow explicit override per run if needed.
+        self._cdp_url = cdp_url or CFG_CDP_URL
         self._p = None
         self._browser = None
         self.page: Optional[Page] = None

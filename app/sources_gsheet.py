@@ -1,13 +1,13 @@
 # app/sources_gsheet.py
 from __future__ import annotations
 
-import os
 import time
 from dataclasses import dataclass
 from typing import Iterable, List, Tuple
 
 import gspread
 from google.oauth2.service_account import Credentials
+from app.config import GSHEET_STATUS_COLUMN, ANSWER_COLUMN
 
 
 def _col_letter_to_index(letter: str) -> int:
@@ -52,8 +52,8 @@ class GoogleSheetSource:
 
         self._q_col_idx = _col_letter_to_index(column_letter)
         self._cfg = SheetConfig(
-            status_col_letter=os.getenv("GSHEET_STATUS_COLUMN", "B"),
-            answer_col_letter=os.getenv("ANSWER_COLUMN", "C"),
+            status_col_letter=GSHEET_STATUS_COLUMN,
+            answer_col_letter=ANSWER_COLUMN,
         )
 
     # --- reading -------------------------------------------------------------
