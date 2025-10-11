@@ -33,9 +33,6 @@ FIRST_MESSAGE_GRACE_S = float(os.getenv("FIRST_MESSAGE_GRACE_S", "15.0"))  # ext
 NEXT_AFTER_FINISH_MIN_S = float(os.getenv("NEXT_AFTER_FINISH_MIN_S", "3.0"))
 NEXT_AFTER_FINISH_MAX_S = float(os.getenv("NEXT_AFTER_FINISH_MAX_S", "4.0"))
 
-# --- Legacy window matching (not used in Playwright flow) ---
-DEFAULT_WINDOW_MATCH = "ChatGPT"
-
 # --- New: pacing/breaks & safety cooldown (all seconds; override via .env if desired) ---
 # Mini break after every 15 questions
 MINI_BREAK_EVERY_N = int(os.getenv("MINI_BREAK_EVERY_N", "15"))
