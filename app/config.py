@@ -20,8 +20,7 @@ DEFAULT_DELAY_SECONDS = 30           # NOT used for Playwright flow pacing, kept
 ALMOST_DONE_THRESHOLD = 60
 NOTIFY_EVERY_N: int | None = None
 
-# New: simple ETA model (seconds per question)
-# You can override via .env: EST_SECONDS_PER_QUESTION=45
+# --- ETA model (baseline seconds per question, used with dynamic blend) ---
 EST_SECONDS_PER_QUESTION = int(os.getenv("EST_SECONDS_PER_QUESTION", "45"))
 
 # --- Playwright / Chrome CDP ---
@@ -34,5 +33,20 @@ FIRST_MESSAGE_GRACE_S = float(os.getenv("FIRST_MESSAGE_GRACE_S", "15.0"))  # ext
 NEXT_AFTER_FINISH_MIN_S = float(os.getenv("NEXT_AFTER_FINISH_MIN_S", "3.0"))
 NEXT_AFTER_FINISH_MAX_S = float(os.getenv("NEXT_AFTER_FINISH_MAX_S", "4.0"))
 
-# --- Window matching kept only for legacy UI mode (not used in Playwright flow) ---
+# --- Legacy window matching (not used in Playwright flow) ---
 DEFAULT_WINDOW_MATCH = "ChatGPT"
+
+# --- New: pacing/breaks & safety cooldown (all seconds; override via .env if desired) ---
+# Mini break after every 15 questions
+MINI_BREAK_EVERY_N = int(os.getenv("MINI_BREAK_EVERY_N", "15"))
+MINI_BREAK_MIN_S   = int(os.getenv("MINI_BREAK_MIN_S", str(8 * 60)))   # 8 minutes
+MINI_BREAK_MAX_S   = int(os.getenv("MINI_BREAK_MAX_S", str(14 * 60)))  # 14 minutes
+
+# Long break after every 100 questions
+LONG_BREAK_EVERY_N = int(os.getenv("LONG_BREAK_EVERY_N", "100"))
+LONG_BREAK_MIN_S   = int(os.getenv("LONG_BREAK_MIN_S", str(30 * 60)))  # 30 minutes
+LONG_BREAK_MAX_S   = int(os.getenv("LONG_BREAK_MAX_S", str(48 * 60)))  # 48 minutes
+
+# Safety: if continuous runtime reaches 12h, pause for 6h then continue
+MAX_CONTINUOUS_RUNTIME_S = int(os.getenv("MAX_CONTINUOUS_RUNTIME_S", str(12 * 60 * 60)))  # 12 hours
+COOLDOWN_RUNTIME_S       = int(os.getenv("COOLDOWN_RUNTIME_S",       str(6 * 60 * 60)))   # 6 hours

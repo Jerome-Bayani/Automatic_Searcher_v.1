@@ -12,7 +12,13 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 from app.runner import run
 from app.sources_gsheet import GoogleSheetSource
-from app.config import DEFAULT_DELAY_SECONDS, EST_SECONDS_PER_QUESTION
+from app.config import (
+    DEFAULT_DELAY_SECONDS,
+    EST_SECONDS_PER_QUESTION,
+    MINI_BREAK_EVERY_N, MINI_BREAK_MIN_S, MINI_BREAK_MAX_S,
+    LONG_BREAK_EVERY_N, LONG_BREAK_MIN_S, LONG_BREAK_MAX_S,
+    MAX_CONTINUOUS_RUNTIME_S, COOLDOWN_RUNTIME_S,
+)
 from app.notifications import notify, notify_error  # uses requests (sync), very reliable
 from app.shutdown import install as install_shutdown_hook  # keeps your exit notifications
 
@@ -33,8 +39,10 @@ _running: bool = False
 _stop_event: Optional[threading.Event] = None
 _job_task: Optional[asyncio.Task] = None
 
+
 def _ok_sender(update: Update) -> bool:
     return bool(update.effective_chat and update.effective_chat.id == CHAT_ID)
+
 
 async def _send(ctx: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     """
@@ -47,16 +55,63 @@ async def _send(ctx: ContextTypes.DEFAULT_TYPE, text: str) -> None:
         notify_error(f"{VM_NAME} agent send", e)
         notify(f"[{VM_NAME}] {text}")
 
+
 def _fmt_mmss(seconds: int) -> str:
-    m, s = divmod(max(0, seconds), 60)
+    m, s = divmod(max(0, int(seconds)), 60)
     return f"{m:d}m {s:02d}s"
+
+
+def _avg(a: int, b: int) -> float:
+    return (float(a) + float(b)) / 2.0
+
+
+def _project_eta_seconds(total_questions: int, est_seconds_per_q: int) -> int:
+    """
+    Project ETA including:
+      - baseline time per question
+      - mini breaks after every 15 (if more remain), duration averaged (min..max)
+      - long breaks after every 100 (if more remain), duration averaged (min..max)
+      - 12h safety cooldown (adds 6h each time the projected elapsed crosses 12h)
+    Notes:
+      * Breaks are counted when the milestone < total (i.e., if exactly N=100, the long break
+        does NOT apply because the run would end right at 100).
+      * Safety cooldown treats all elapsed time (including breaks) as contributing toward 12h.
+        Cooldown time itself does not contribute to the "continuous" window.
+    """
+    if total_questions <= 0:
+        return 0
+
+    # Base time
+    base = total_questions * int(est_seconds_per_q)
+
+    # Break counts (only if more questions remain past the milestone)
+    # mini at 15,30,45,... < total
+    num_mini = (total_questions - 1) // max(1, int(MINI_BREAK_EVERY_N))
+    # long at 100,200,... < total
+    num_long = (total_questions - 1) // max(1, int(LONG_BREAK_EVERY_N))
+
+    avg_mini = _avg(int(MINI_BREAK_MIN_S), int(MINI_BREAK_MAX_S))
+    avg_long = _avg(int(LONG_BREAK_MIN_S), int(LONG_BREAK_MAX_S))
+
+    breaks_total = int(num_mini * avg_mini + num_long * avg_long)
+
+    # Duration without cooldowns (but including breaks, which DO count to continuous time)
+    duration_wo_cooldown = base + breaks_total
+
+    # Safety cooldowns: every time the "continuous" elapsed crosses 12h, insert a 6h pause.
+    # Because cooldown resets the "continuous" window, we can compute the count directly:
+    num_cooldowns = duration_wo_cooldown // int(MAX_CONTINUOUS_RUNTIME_S)
+    cooldown_total = int(num_cooldowns * int(COOLDOWN_RUNTIME_S))
+
+    return int(duration_wo_cooldown + cooldown_total)
+
 
 def _work():
     """Runs in a thread; sends error or finished notification and clears running flag."""
     global _running
     start_ts = time.time()
     try:
-        # Build source & pre-count questions to announce ETA
+        # Build source & pre-count questions to announce ETA (including planned breaks & cooldown)
         src = GoogleSheetSource(GSA_JSON, SHEET_ID, worksheet=WORKSHEET, column_letter=COLUMN)
         pending = list(src.iter_pending())
         total = len(pending)
@@ -66,7 +121,7 @@ def _work():
             _running = False
             return
 
-        eta_sec = total * EST_SECONDS_PER_QUESTION
+        eta_sec = _project_eta_seconds(total, EST_SECONDS_PER_QUESTION)
         notify(f"[{VM_NAME}] Job started • {total} questions • ETA ~ {_fmt_mmss(eta_sec)}")
 
         # Now run using the same source instance (no double reads in Sheets)
@@ -81,6 +136,7 @@ def _work():
     finally:
         _running = False
 
+
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _ok_sender(update):
         return
@@ -92,12 +148,13 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     _running = True
     _stop_event = threading.Event()
 
-    # Keep this line (quick confirmation in chat), but the detailed ETA is sent by _work()
+    # Quick confirmation in chat (detailed ETA comes from _work())
     await _send(ctx, f"Starting job • delay={DEFAULT_DELAY_SECONDS}s")
 
     loop = asyncio.get_running_loop()
     _job_task = loop.create_task(asyncio.to_thread(_work))  # background; do NOT await
-    # Remove the old "Job started." message; we now send a detailed one from _work().
+    # We don't send "Job started" here; _work() sends with total+ETA.
+
 
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _ok_sender(update):
@@ -109,19 +166,23 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         await _send(ctx, "Already idle.")
 
+
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _ok_sender(update):
         return
     await _send(ctx, "Status: RUNNING" if _running else "Status: IDLE")
+
 
 async def cmd_ping(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _ok_sender(update):
         return
     await _send(ctx, "Pong ✅")
 
+
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     err = context.error or Exception("unknown error")
     notify_error(f"{VM_NAME} agent handler", err)
+
 
 def _on_process_exit() -> None:
     """Best-effort exit notifier (see app/shutdown.py)."""
@@ -136,6 +197,7 @@ def _on_process_exit() -> None:
     except Exception:
         pass
 
+
 def main() -> None:
     install_shutdown_hook(_on_process_exit)
 
@@ -147,6 +209,7 @@ def main() -> None:
     app.add_error_handler(on_error)
     print(f"Agent online for {VM_NAME}. /start /stop /status /ping")
     app.run_polling(close_loop=False)
+
 
 if __name__ == "__main__":
     main()
